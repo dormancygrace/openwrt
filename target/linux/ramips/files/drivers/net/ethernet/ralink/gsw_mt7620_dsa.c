@@ -442,7 +442,16 @@ static void mt7620_gsw_set_port_matrix(struct mt7620_gsw *gsw, int port,
 		       FIELD_PREP(MT7620_PCR_MATRIX, matrix));
 }
 
-static void mt7620_gsw_update_port_matrices(struct dsa_switch *ds)
+static bool mt7620_gsw_is_forwarding(struct dsa_port *dp, int port, u8 state)
+{
+	if (dp->index == port)
+		return state == BR_STATE_FORWARDING;
+
+	return dp->stp_state == BR_STATE_FORWARDING;
+}
+
+static void mt7620_gsw_update_matrices(struct dsa_switch *ds, int port,
+				       u8 state)
 {
 	struct mt7620_gsw *gsw = ds->priv;
 	struct dsa_port *dp, *other_dp;
@@ -450,11 +459,12 @@ static void mt7620_gsw_update_port_matrices(struct dsa_switch *ds)
 	dsa_switch_for_each_user_port(dp, ds) {
 		u8 matrix = BIT(MT7620_DSA_CPU_PORT);
 
-		if (dp->stp_state == BR_STATE_FORWARDING) {
+		if (mt7620_gsw_is_forwarding(dp, port, state)) {
 			dsa_switch_for_each_user_port(other_dp, ds) {
 				if (dp == other_dp)
 					continue;
-				if (other_dp->stp_state != BR_STATE_FORWARDING)
+				if (!mt7620_gsw_is_forwarding(other_dp, port,
+							      state))
 					continue;
 				if (dsa_port_bridge_same(dp, other_dp))
 					matrix |= BIT(other_dp->index);
@@ -627,7 +637,8 @@ static void mt7620_gsw_port_stp_state_set(struct dsa_switch *ds, int port,
 	}
 
 	mt7620_gsw_rmw(gsw, MT7620_GSW_SSC(port), mask, val);
-	mt7620_gsw_update_port_matrices(ds);
+	/* DSA updates dp->stp_state only after this callback returns. */
+	mt7620_gsw_update_matrices(ds, port, state);
 }
 
 static int
@@ -689,7 +700,7 @@ static int mt7620_gsw_port_bridge_join(struct dsa_switch *ds, int port,
 		       MT7620_PCR_PORT_VLAN,
 		       FIELD_PREP(MT7620_PCR_PORT_VLAN,
 				  MT7620_PORT_FALLBACK_MODE));
-	mt7620_gsw_update_port_matrices(ds);
+	mt7620_gsw_update_matrices(ds, -1, BR_STATE_DISABLED);
 
 	return 0;
 }
@@ -699,7 +710,7 @@ static void mt7620_gsw_port_bridge_leave(struct dsa_switch *ds, int port,
 {
 	struct mt7620_gsw *gsw = ds->priv;
 
-	mt7620_gsw_update_port_matrices(ds);
+	mt7620_gsw_update_matrices(ds, -1, BR_STATE_DISABLED);
 	mt7620_gsw_rmw(gsw, MT7620_GSW_PCR(port),
 		       MT7620_PCR_PORT_VLAN,
 		       FIELD_PREP(MT7620_PCR_PORT_VLAN,
