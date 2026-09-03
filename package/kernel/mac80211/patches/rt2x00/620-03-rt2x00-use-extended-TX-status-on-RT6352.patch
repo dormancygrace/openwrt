@@ -1,0 +1,269 @@
+From: Gleb Pesin <dormancygrace@gmail.com>
+Date: Thu, 3 Sep 2026 00:20:00 +0000
+Subject: [PATCH] wifi: rt2x00: use extended TX status on RT6352
+
+RT6352 provides TX_STA_FIFO_EXT with the packet ID and exact retry
+count for the frame at the head of TX_STA_FIFO. The programming guide
+requires reading the extension before popping the corresponding status
+from TX_STA_FIFO.
+
+The regular TX_STA_FIFO bits 4:1 are reserved on RT6352, so obtain the
+hardware queue and packet ID used for status matching from the extension.
+Use its retry count instead of estimating successful retries from the
+difference between the requested and final MCS or reporting the configured
+limit for failed transmissions.
+
+Extend the software TX-status FIFO entries to carry both registers. Keep
+the existing status path unchanged for other rt2800 devices.
+
+The kfifo allocation size is expressed in elements, not bytes. Drop the
+old sizeof(u32) multiplier while changing its element type so it still
+holds exactly the worst-case number of outstanding TX entries.
+
+Signed-off-by: Gleb Pesin <dormancygrace@gmail.com>
+---
+--- a/drivers/net/wireless/ralink/rt2x00/rt2800.h
++++ b/drivers/net/wireless/ralink/rt2x00/rt2800.h
+@@ -1944,6 +1944,13 @@
+ #define TX_STA_FIFO_PHYMODE		FIELD32(0xc0000000)
+ 
+ /*
++ * TX_STA_FIFO_EXT: per-frame TX status extension (RT6352).
++ */
++#define TX_STA_FIFO_EXT			0x1798
++#define TX_STA_FIFO_EXT_RETRY_COUNT	FIELD32(0x000000ff)
++#define TX_STA_FIFO_EXT_PACKET_ID	FIELD32(0x0000ff00)
++
++/*
+  * TX_AGG_CNT: Debug counter
+  */
+ #define TX_AGG_CNT			0x171c
+--- a/drivers/net/wireless/ralink/rt2x00/rt2800lib.c
++++ b/drivers/net/wireless/ralink/rt2x00/rt2800lib.c
+@@ -975,11 +975,12 @@
+ 	skbdesc->tx_rate_flags = flags;
+ }
+ 
+-static bool rt2800_txdone_entry_check(struct queue_entry *entry, u32 reg)
++static bool rt2800_txdone_entry_check(struct queue_entry *entry, u32 reg,
++				      u8 pid)
+ {
+ 	__le32 *txwi;
+ 	u32 word;
+-	int wcid, ack, pid;
++	int wcid, ack;
+ 	int tx_wcid, tx_ack, tx_pid, is_agg;
+ 
+ 	/*
+@@ -992,7 +993,6 @@
+ 
+ 	wcid	= rt2x00_get_field32(reg, TX_STA_FIFO_WCID);
+ 	ack	= rt2x00_get_field32(reg, TX_STA_FIFO_TX_ACK_REQUIRED);
+-	pid	= rt2x00_get_field32(reg, TX_STA_FIFO_PID_TYPE);
+ 	is_agg	= rt2x00_get_field32(reg, TX_STA_FIFO_TX_AGGRE);
+ 
+ 	/*
+@@ -1016,8 +1016,8 @@
+ 	return true;
+ }
+ 
+-void rt2800_txdone_entry(struct queue_entry *entry, u32 status, __le32 *txwi,
+-			 bool match)
++void rt2800_txdone_entry(struct queue_entry *entry, u32 status,
++			 u32 status_ext, __le32 *txwi, bool match)
+ {
+ 	struct rt2x00_dev *rt2x00dev = entry->queue->rt2x00dev;
+ 	struct rt2800_drv_data *drv_data = rt2x00dev->drv_data;
+@@ -1072,19 +1072,26 @@
+ 	if (!ack_req)
+ 		__set_bit(TXDONE_NO_ACK_REQ, &txdesc.flags);
+ 
++	if (rt2x00_get_field32(status, TX_STA_FIFO_TX_SUCCESS))
++		__set_bit(TXDONE_SUCCESS, &txdesc.flags);
++	else
++		__set_bit(TXDONE_FAILURE, &txdesc.flags);
++
+ 	/*
+-	 * Ralink has a retry mechanism using a global fallback
+-	 * table. We setup this fallback table to try the immediate
+-	 * lower rate for all rates. In the TX_STA_FIFO, the MCS field
+-	 * always contains the MCS used for the last transmission, be
+-	 * it successful or not.
+-	 */
+-	if (rt2x00_get_field32(status, TX_STA_FIFO_TX_SUCCESS)) {
++	 * RT6352 reports the exact retry count in TX_STA_FIFO_EXT. Other
++	 * Ralink chips use a global fallback table, so keep estimating their
++	 * retry count from the requested and final MCS as before.
++	 */
++	if (rt2x00_rt(rt2x00dev, RT6352)) {
++		txdesc.retry = min_t(int,
++				     rt2x00_get_field32(status_ext,
++							TX_STA_FIFO_EXT_RETRY_COUNT),
++				     U8_MAX - 1);
++	} else if (rt2x00_get_field32(status, TX_STA_FIFO_TX_SUCCESS)) {
+ 		/*
+ 		 * Transmission succeeded. The number of retries is
+ 		 * mcs - real_mcs
+ 		 */
+-		__set_bit(TXDONE_SUCCESS, &txdesc.flags);
+ 		txdesc.retry = ((mcs > real_mcs) ? mcs - real_mcs : 0);
+ 	} else {
+ 		/*
+@@ -1092,7 +1099,6 @@
+ 		 * always 7 in this case (for a total number of 8
+ 		 * frames sent).
+ 		 */
+-		__set_bit(TXDONE_FAILURE, &txdesc.flags);
+ 		txdesc.retry = rt2x00dev->long_retry;
+ 	}
+ 
+@@ -1122,8 +1128,9 @@
+ {
+ 	struct data_queue *queue;
+ 	struct queue_entry *entry;
++	struct rt2x00_txstatus txstatus;
+ 	u32 reg;
+-	u8 qid;
++	u8 pid, qid;
+ 	bool match;
+ 	static const u8 rt2ac[] = {
+ 		IEEE80211_AC_BE,
+@@ -1132,12 +1139,20 @@
+ 		IEEE80211_AC_VO,
+ 	};
+ 
+-	while (quota-- > 0 && kfifo_get(&rt2x00dev->txstatus_fifo, &reg)) {
++	while (quota-- > 0 && kfifo_get(&rt2x00dev->txstatus_fifo, &txstatus)) {
++		reg = txstatus.status;
++		if (rt2x00_rt(rt2x00dev, RT6352))
++			pid = rt2x00_get_field32(txstatus.status_ext,
++						 TX_STA_FIFO_EXT_PACKET_ID) & 0xf;
++		else
++			pid = rt2x00_get_field32(reg, TX_STA_FIFO_PID_TYPE);
++
+ 		/*
+-		 * TX_STA_FIFO_PID_QUEUE is a 2-bit field, thus qid is
+-		 * guaranteed to be one of the TX QIDs .
++		 * The low two packet ID bits select one of the hardware TX
++		 * queues. RT6352 obtains them from TX_STA_FIFO_EXT because its
++		 * TX_STA_FIFO bits 4:1 are reserved.
+ 		 */
+-		qid = rt2x00_get_field32(reg, TX_STA_FIFO_PID_QUEUE);
++		qid = pid & 0x3;
+ 		/* Convert Ralink hardware queue index to IEEE80211 queue id. */
+ 		qid = rt2ac[qid];
+ 		queue = rt2x00queue_get_tx_queue(rt2x00dev, qid);
+@@ -1157,8 +1172,9 @@
+ 			break;
+ 		}
+ 
+-		match = rt2800_txdone_entry_check(entry, reg);
+-		rt2800_txdone_entry(entry, reg, rt2800_drv_get_txwi(entry), match);
++		match = rt2800_txdone_entry_check(entry, reg, pid);
++		rt2800_txdone_entry(entry, reg, txstatus.status_ext,
++				    rt2800_drv_get_txwi(entry), match);
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(rt2800_txdone);
+--- a/drivers/net/wireless/ralink/rt2x00/rt2800lib.h
++++ b/drivers/net/wireless/ralink/rt2x00/rt2800lib.h
+@@ -200,8 +200,8 @@
+ 			  struct txentry_desc *txdesc);
+ void rt2800_process_rxwi(struct queue_entry *entry, struct rxdone_entry_desc *txdesc);
+ 
+-void rt2800_txdone_entry(struct queue_entry *entry, u32 status, __le32 *txwi,
+-			 bool match);
++void rt2800_txdone_entry(struct queue_entry *entry, u32 status,
++			 u32 status_ext, __le32 *txwi, bool match);
+ void rt2800_txdone(struct rt2x00_dev *rt2x00dev, unsigned int quota);
+ void rt2800_txdone_nostatus(struct rt2x00_dev *rt2x00dev);
+ bool rt2800_txstatus_timeout(struct rt2x00_dev *rt2x00dev);
+--- a/drivers/net/wireless/ralink/rt2x00/rt2800mmio.c
++++ b/drivers/net/wireless/ralink/rt2x00/rt2800mmio.c
+@@ -279,7 +279,7 @@
+ 
+ static void rt2800mmio_fetch_txstatus(struct rt2x00_dev *rt2x00dev)
+ {
+-	u32 status;
++	struct rt2x00_txstatus txstatus = {};
+ 	unsigned long flags;
+ 
+ 	/*
+@@ -300,11 +300,18 @@
+ 	spin_lock_irqsave(&rt2x00dev->irqmask_lock, flags);
+ 
+ 	while (!kfifo_is_full(&rt2x00dev->txstatus_fifo)) {
+-		status = rt2x00mmio_register_read(rt2x00dev, TX_STA_FIFO);
+-		if (!rt2x00_get_field32(status, TX_STA_FIFO_VALID))
++		/* The RT6352 programming guide mandates this read order. */
++		if (rt2x00_rt(rt2x00dev, RT6352))
++			txstatus.status_ext =
++				rt2x00mmio_register_read(rt2x00dev,
++							 TX_STA_FIFO_EXT);
++
++		txstatus.status = rt2x00mmio_register_read(rt2x00dev,
++							   TX_STA_FIFO);
++		if (!rt2x00_get_field32(txstatus.status, TX_STA_FIFO_VALID))
+ 			break;
+ 
+-		kfifo_put(&rt2x00dev->txstatus_fifo, status);
++		kfifo_put(&rt2x00dev->txstatus_fifo, txstatus);
+ 	}
+ 
+ 	spin_unlock_irqrestore(&rt2x00dev->irqmask_lock, flags);
+--- a/drivers/net/wireless/ralink/rt2x00/rt2800usb.c
++++ b/drivers/net/wireless/ralink/rt2x00/rt2800usb.c
+@@ -94,6 +94,9 @@
+ static bool rt2800usb_tx_sta_fifo_read_completed(struct rt2x00_dev *rt2x00dev,
+ 						 int urb_status, u32 tx_status)
+ {
++	struct rt2x00_txstatus status = {
++		.status = tx_status,
++	};
+ 	bool valid;
+ 
+ 	if (urb_status) {
+@@ -105,7 +108,7 @@
+ 
+ 	valid = rt2x00_get_field32(tx_status, TX_STA_FIFO_VALID);
+ 	if (valid) {
+-		if (!kfifo_put(&rt2x00dev->txstatus_fifo, tx_status))
++		if (!kfifo_put(&rt2x00dev->txstatus_fifo, status))
+ 			rt2x00_warn(rt2x00dev, "TX status FIFO overrun\n");
+ 
+ 		queue_work(rt2x00dev->workqueue, &rt2x00dev->txdone_work);
+--- a/drivers/net/wireless/ralink/rt2x00/rt2x00.h
++++ b/drivers/net/wireless/ralink/rt2x00/rt2x00.h
+@@ -723,6 +723,11 @@
+ 	NUM_IF_COMB,
+ };
+ 
++struct rt2x00_txstatus {
++	u32 status;
++	u32 status_ext;
++};
++
+ /*
+  * rt2x00 device structure.
+  */
+@@ -974,7 +979,7 @@
+ 	/*
+ 	 * FIFO for storing tx status reports between isr and tasklet.
+ 	 */
+-	DECLARE_KFIFO_PTR(txstatus_fifo, u32);
++	DECLARE_KFIFO_PTR(txstatus_fifo, struct rt2x00_txstatus);
+ 
+ 	/*
+ 	 * Timer to ensure tx status reports are read (rt2800usb).
+--- a/drivers/net/wireless/ralink/rt2x00/rt2x00dev.c
++++ b/drivers/net/wireless/ralink/rt2x00/rt2x00dev.c
+@@ -1161,8 +1161,7 @@
+ 		 */
+ 		int kfifo_size =
+ 			roundup_pow_of_two(rt2x00dev->ops->tx_queues *
+-					   rt2x00dev->tx->limit *
+-					   sizeof(u32));
++					   rt2x00dev->tx->limit);
+ 
+ 		status = kfifo_alloc(&rt2x00dev->txstatus_fifo, kfifo_size,
+ 				     GFP_KERNEL);
