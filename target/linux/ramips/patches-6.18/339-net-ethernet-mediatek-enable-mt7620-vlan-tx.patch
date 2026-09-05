@@ -152,7 +152,7 @@ Signed-off-by: Gleb Pesin <dormancygrace@gmail.com>
 +			break;
 +		}
 +
-+	WRITE_ONCE(eth->mt7620_vlan_vid[idx], 0);
++	WRITE_ONCE(eth->mt7620_vlan_vid[idx], VLAN_N_VID);
 +	mtk_mt7620_vlan_write(eth, idx, replacement);
 +	WRITE_ONCE(eth->mt7620_vlan_vid[idx], replacement);
 +	if (replacement)
