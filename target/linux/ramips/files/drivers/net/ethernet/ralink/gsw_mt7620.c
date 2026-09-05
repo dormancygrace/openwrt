@@ -434,10 +434,10 @@ int mt7620_gsw_upstream_init(struct device *parent, struct net_device *conduit)
 	mutex_unlock(&gsw->reg_mutex);
 
 	ret = mt7620_gsw_dsa_device_register(gsw, parent);
-	if (ret)
+	if (ret) {
 		mt7620_gsw_upstream_mdio_cleanup(gsw);
-	if (ret)
 		gsw->conduit = NULL;
+	}
 
 out_put_device:
 	put_device(&pdev->dev);
